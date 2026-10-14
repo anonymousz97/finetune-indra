@@ -1,0 +1,16 @@
+# environments and caches
+.venv/
+__pycache__/
+*.pyc
+hf_cache/
+.uv_cache/
+
+# data, crops, checkpoints and exported models -- large, regenerable, and the
+# models carry Datalab's license, so they belong on the Hub, not in git
+data/
+work/
+logs/
+*.npz
+*.pt
+*.onnx
+*.jsonl

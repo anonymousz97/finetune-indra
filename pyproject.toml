@@ -1,0 +1,36 @@
+[project]
+name = "finetune-indra"
+version = "0.1.0"
+description = "Fine-tune the line recognizer of Datalab's Indra OCR on your own transcriptions"
+requires-python = ">=3.11,<3.14"
+dependencies = [
+    # 2.11.0 / 0.26.0 is the build verified on Blackwell (RTX PRO 6000, sm_120).
+    # onnx2torch depends on torchvision, and an unpinned torchvision can drag in a
+    # mismatched torch -- so both are pinned together.
+    "torch==2.11.0",
+    "torchvision==0.26.0",
+    # Pinned to the versions the conversion was proven equivalent under
+    # (452/452 identical decoded lines against Datalab's ONNX graph).
+    "onnx==1.23.2",
+    "onnx2torch==1.5.15",
+    "onnxruntime==1.31.0",
+    # The pipeline itself: detector, reading order, crop rule, vocabulary.
+    "indra-ocr==0.3.1",
+    # C++ Levenshtein for CER; pure Python is ~3 s per page pair.
+    "rapidfuzz>=3.9",
+    "numpy>=2",
+    "huggingface-hub>=0.34",
+]
+
+[tool.uv]
+# Blackwell (sm_120) needs the cu128 wheels; the default PyPI Linux wheel installs
+# cleanly and then dies at the first kernel launch with "no kernel image is
+# available for execution". macOS takes the normal PyPI wheel (MPS).
+[[tool.uv.index]]
+name = "pytorch-cu128"
+url = "https://download.pytorch.org/whl/cu128"
+explicit = true
+
+[tool.uv.sources]
+torch = [{ index = "pytorch-cu128", marker = "sys_platform == 'linux'" }]
+torchvision = [{ index = "pytorch-cu128", marker = "sys_platform == 'linux'" }]
