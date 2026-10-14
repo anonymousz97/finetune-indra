@@ -32,7 +32,7 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 from score import score  # noqa: E402
-from shipped import MODEL_DIR  # noqa: E402
+from shipped import REPO, REVISION  # noqa: E402
 
 UNMODIFIED = ["det.onnx", "order.onnx", "orient.onnx", "script.onnx", "rec_cjk.onnx"]
 
@@ -153,7 +153,10 @@ or your employer offer a product or service that competes with Datalab's. Broade
 licensing is available from Datalab at https://www.datalab.to/.
 """
     (args.model_dir / "README.md").write_text(card, encoding="utf-8")
-    shutil.copy(MODEL_DIR / "LICENSE", args.model_dir / "LICENSE")
+    # Fetched explicitly at the PINNED revision: Indra's own loader caches only the
+    # model files, and the license shipped must be the one for these exact weights.
+    from huggingface_hub import hf_hub_download
+    shutil.copy(hf_hub_download(REPO, "LICENSE", revision=REVISION), args.model_dir / "LICENSE")
     print(f"wrote {args.model_dir / 'README.md'} and LICENSE | "
           f"shipped {z['cer_nfd']:.4f} -> fine-tuned {f['cer_nfd']:.4f}")
     return 0

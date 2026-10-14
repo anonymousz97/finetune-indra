@@ -80,7 +80,10 @@ def main() -> int:
         # Rebuild from Datalab's ONNX, size the head from the checkpoint, load weights.
         from convert_rec import rec_module
         sd = torch.load(args.state, map_location="cpu", weights_only=True)
-        model = rec_module(MODEL_DIR / "rec.onnx", args.out / "_convert")
+        # Conversion scratch goes to a temp dir: args.out is the folder that gets
+        # PUBLISHED, and a leftover _convert/ there would ship to the Hub.
+        import tempfile
+        model = rec_module(MODEL_DIR / "rec.onnx", Path(tempfile.mkdtemp()))
         head_key = next(k for k in sd if k.endswith(".weight") and sd[k].shape[1:] == (128, 1)
                         and sd[k].shape[0] >= 1678)
         name = head_key[: -len(".weight")]

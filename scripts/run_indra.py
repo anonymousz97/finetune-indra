@@ -76,7 +76,7 @@ def main() -> int:
                 "seconds": round(time.time() - t, 3), "error": err, **meta,
             }, ensure_ascii=False) + "\n")
             if i % 50 == 0 or i == len(rows):
-                print(f"ds{args.dataset}: {i}/{len(rows)} pages "
+                print(f"{args.split}: {i}/{len(rows)} pages "
                       f"({(time.time() - started) / i:.2f}s/page)", flush=True)
     print(f"wrote {out}", flush=True)
     return 0
