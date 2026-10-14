@@ -14,3 +14,7 @@ logs/
 *.pt
 *.onnx
 *.jsonl
+
+# ...except the example data, which is meant to be committed
+!examples/
+!examples/**

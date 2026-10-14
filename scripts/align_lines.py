@@ -102,7 +102,9 @@ def main() -> int:
     ap.add_argument("--split", default="train")
     ap.add_argument("--out", type=Path, required=True)
     ap.add_argument("--model-dir", type=Path, default=SHIPPED)
-    ap.add_argument("--min-sim", type=float, default=0.6)
+    # 0.3 was chosen by inspecting pairs: 0.3-0.6 is mostly correct handwriting that
+    # Indra misreads; below 0.3 correct readings attach to the wrong lines.
+    ap.add_argument("--min-sim", type=float, default=0.3)
     ap.add_argument("--max-len-ratio", type=float, default=1.5)
     ap.add_argument("--workers", type=int, default=8)
     ap.add_argument("--limit", type=int, default=0)

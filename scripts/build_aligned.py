@@ -59,6 +59,11 @@ def main() -> int:
                 labels.append(text)
                 pages.append(row["page"])
                 sims.append(sim)
+        if not crops:
+            raise SystemExit(
+                f"{split}: alignment produced no line pairs. Either --min-sim is too strict "
+                f"(0.3 is the tested value), or the transcriptions are not line-by-line -- a "
+                f"paragraph written as one 'line' cannot pair with any single detected line.")
         widths = np.array([c.shape[1] for c in crops], np.int32)
         flat = np.concatenate([(c * 255).round().astype(np.uint8).ravel() for c in crops])
         np.savez_compressed(args.out / f"{split}.npz", flat=flat, widths=widths,
