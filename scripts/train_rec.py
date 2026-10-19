@@ -171,8 +171,15 @@ def main() -> int:
 
     # Control first: the UNMODIFIED recognizer on the same ground-truth crops.
     zero = evaluate(model, va_c, va_l, va_w, base, device)
-    print(f"zero-shot recognizer on {len(va_l):,} GT holdout lines: "
+    print(f"zero-shot recognizer on {len(va_l):,} GT validation lines: "
           f"CER_nfd {zero['cer_nfd']:.4f}  exact lines {zero['line_exact']:.1%}", flush=True)
+
+    test_zero = None
+    if (args.lines / "test.npz").exists() and (args.lines / "test-labels.json").exists():
+        te_c, te_l, te_w = load_lines(args.lines, "test")
+        test_zero = evaluate(model, te_c, te_l, te_w, base, device)
+        print(f"zero-shot recognizer on {len(te_l):,} GT TEST lines: "
+              f"CER_nfd {test_zero['cer_nfd']:.4f}  exact lines {test_zero['line_exact']:.1%}", flush=True)
 
     head_name, sources = widen_head(model.cpu(), base.n_classes, new_chars, base.index)
     model = model.to(device)
@@ -187,12 +194,16 @@ def main() -> int:
           f"(dropped {len(tr_l) - len(keep)}: unencodable or too long for CTC) | "
           f"holdout lines with a char unseen in training: {va_oov}", flush=True)
 
+    if device == "cuda":
+        torch.backends.cudnn.benchmark = True
+
     ctc = torch.nn.CTCLoss(blank=0, zero_infinity=True)
     opt = torch.optim.AdamW(model.parameters(), lr=args.lr, weight_decay=0.01)
     batches_per_epoch = len(width_batches([int(tr_w[i]) for i in keep], args.batch))
     total = args.epochs * batches_per_epoch
     sched = torch.optim.lr_scheduler.OneCycleLR(opt, max_lr=args.lr, total_steps=total, pct_start=0.05)
     history, best = [], (zero["cer_nfd"], -1)
+    total_train_start = time.time()
     for epoch in range(args.epochs):
         freeze_bn(model)
         batches = width_batches([int(tr_w[i]) for i in keep], args.batch)
@@ -201,31 +212,58 @@ def main() -> int:
         for b in batches:
             idx = [keep[i] for i in b]
             x, w = pad(tr_c, idx, tr_w)
-            logp = model(x.to(device), w.to(device)).float().log_softmax(-1).transpose(0, 1).cpu()
+            logp = model(x.to(device), w.to(device)).float().log_softmax(-1).transpose(0, 1)
             tgt = [enc[j] for j in idx]
-            loss = ctc(logp, torch.tensor([t for s in tgt for t in s]),
-                       torch.tensor([math.ceil(int(tr_w[j]) / 4) for j in idx]),
-                       torch.tensor([len(s) for s in tgt]))
+            loss = ctc(logp, torch.tensor([t for s in tgt for t in s], device=device),
+                       torch.tensor([math.ceil(int(tr_w[j]) / 4) for j in idx], device=device),
+                       torch.tensor([len(s) for s in tgt], device=device))
             opt.zero_grad(); loss.backward()
             torch.nn.utils.clip_grad_norm_(model.parameters(), 5.0)
             opt.step(); sched.step()
             losses.append(loss.item())
         ev = evaluate(model, va_c, va_l, va_w, vocab, device)
+        epoch_sec = time.time() - t0
+        speed = len(keep) / max(1e-3, epoch_sec)
         history.append({"epoch": epoch + 1, "loss": float(np.mean(losses)), **ev,
-                        "seconds": round(time.time() - t0, 1)})
+                        "seconds": round(epoch_sec, 1), "samples_per_sec": round(speed, 1)})
         print(f"epoch {epoch + 1:2d}  loss {np.mean(losses):.4f}  holdout CER_nfd {ev['cer_nfd']:.4f}  "
-              f"exact lines {ev['line_exact']:.1%}  ({time.time() - t0:.0f}s)", flush=True)
+              f"exact lines {ev['line_exact']:.1%}  ({epoch_sec:.1f}s | {speed:.1f} sample/s)", flush=True)
         if ev["cer_nfd"] < best[0]:
             best = (ev["cer_nfd"], epoch + 1)
             # state_dict is the portable artifact (no torch-version-bound pickle);
             # best.pt is kept for local convenience only.
             torch.save(model.cpu().state_dict(), args.out / "best_state.pt")
             torch.save(model, args.out / "best.pt"); model.to(device)
+    total_train_time = time.time() - total_train_start
     (args.out / "vocab.json").write_text(json.dumps({"blank": 0, "chars": vocab.chars}, ensure_ascii=False))
     (args.out / "history.json").write_text(json.dumps(
         {"zero_shot": zero, "epochs": history, "best_epoch": best[1], "new_chars": new_chars,
-         "warm_starts": dict(zip(new_chars, sources)), "lines_used": len(keep)}, indent=1, ensure_ascii=False))
-    print(f"best holdout CER_nfd {best[0]:.4f} at epoch {best[1]} (zero-shot {zero['cer_nfd']:.4f})")
+         "warm_starts": dict(zip(new_chars, sources)), "lines_used": len(keep),
+         "total_train_time_sec": round(total_train_time, 1)}, indent=1, ensure_ascii=False))
+    print(f"\nbest holdout CER_nfd {best[0]:.4f} at epoch {best[1]} (zero-shot {zero['cer_nfd']:.4f})")
+    print(f"Total training time: {total_train_time:.1f}s ({total_train_time/60:.2f} min)")
+
+    # Test set evaluation if test.npz exists
+    if test_zero is not None:
+        print(f"\nEvaluating best checkpoint on {len(te_l):,} held-out TEST lines...")
+        model.load_state_dict(torch.load(args.out / "best_state.pt", map_location=device))
+        te_ev = evaluate(model, te_c, te_l, te_w, vocab, device)
+        rel_reduc = (test_zero['cer_nfd'] - te_ev['cer_nfd']) / test_zero['cer_nfd'] * 100
+        print("\n" + "=" * 65)
+        print("FINAL TEST EVALUATION COMPARISON (Base vs Fine-Tuned):")
+        print(f"  Total Test Samples   : {len(te_l):,} lines")
+        print(f"  Base Model           : CER_nfd {test_zero['cer_nfd']:.4f} ({test_zero['cer_nfd']*100:.2f}%) | Exact lines: {test_zero['line_exact']:.2%}")
+        print(f"  Fine-tuned Model     : CER_nfd {te_ev['cer_nfd']:.4f} ({te_ev['cer_nfd']*100:.2f}%) | Exact lines: {te_ev['line_exact']:.2%}")
+        print(f"  Relative CER Reduction: {rel_reduc:.2f}%")
+        print(f"  Exact Line Improvement: +{(te_ev['line_exact'] - test_zero['line_exact']) * 100:.2f}%")
+        print("=" * 65 + "\n")
+        (args.out / "test_eval.json").write_text(json.dumps({
+            "test_lines": len(te_l),
+            "base_model": test_zero,
+            "finetuned_model": te_ev,
+            "cer_reduction_pct": rel_reduc,
+            "exact_line_improvement_pct": (te_ev['line_exact'] - test_zero['line_exact']) * 100,
+        }, indent=2, ensure_ascii=False))
     return 0
 
 

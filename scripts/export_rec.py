@@ -117,7 +117,7 @@ def main() -> int:
     print(f"patched {n} parameter tensors into Datalab's graph; ids match the module at 7 widths")
 
     for f in MODEL_DIR.iterdir():
-        if f.name not in ("rec.onnx", "meta.json"):
+        if f.name not in ("rec.onnx", "meta.json") and f.is_file():
             shutil.copy2(f, args.out / f.name)
     meta = json.loads((MODEL_DIR / "meta.json").read_text())
     if args.vocab:
