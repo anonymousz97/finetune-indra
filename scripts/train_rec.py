@@ -42,6 +42,7 @@ import time
 import unicodedata
 from pathlib import Path
 
+import cv2
 import numpy as np
 import torch
 from rapidfuzz.distance import Levenshtein
@@ -123,11 +124,35 @@ def evaluate(model, crops, labels, widths, vocab, device, batch=64) -> dict:
     return {"cer_nfd": errs / max(1, chars), "line_exact": exact / max(1, len(labels))}
 
 
-def pad(crops, idx, widths):
+def augment_crop(crop: np.ndarray) -> np.ndarray:
+    """Random lightweight augmentation on ink crop [32, W] (0=bg, 1=ink)."""
+    r = random.random()
+    if r < 0.2:
+        k = np.ones((1, 2), np.uint8)
+        crop = cv2.dilate(crop, k, iterations=1)
+    elif r < 0.35:
+        k = np.ones((1, 2), np.uint8)
+        crop = cv2.erode(crop, k, iterations=1)
+
+    if random.random() < 0.25:
+        gamma = random.uniform(0.85, 1.2)
+        crop = np.clip(crop ** gamma, 0.0, 1.0)
+
+    if random.random() < 0.15:
+        noise = np.random.normal(0, 0.02, crop.shape).astype(np.float32)
+        crop = np.clip(crop + noise, 0.0, 1.0)
+
+    return crop
+
+
+def pad(crops, idx, widths, augment: bool = False):
     wm = int(math.ceil(max(int(widths[j]) for j in idx) / 8) * 8)
     x = np.zeros((len(idx), 1, 32, wm), np.float32)
     for k, j in enumerate(idx):
-        x[k, 0, :, : widths[j]] = crops[j] / 255.0
+        c = (crops[j] / 255.0).astype(np.float32)
+        if augment:
+            c = augment_crop(c)
+        x[k, 0, :, : widths[j]] = c
     return torch.from_numpy(x), torch.from_numpy(widths[idx].astype(np.int64))
 
 
@@ -211,7 +236,7 @@ def main() -> int:
         t0, losses = time.time(), []
         for b in batches:
             idx = [keep[i] for i in b]
-            x, w = pad(tr_c, idx, tr_w)
+            x, w = pad(tr_c, idx, tr_w, augment=True)
             logp = model(x.to(device), w.to(device)).float().log_softmax(-1).transpose(0, 1)
             tgt = [enc[j] for j in idx]
             loss = ctc(logp, torch.tensor([t for s in tgt for t in s], device=device),
