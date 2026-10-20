@@ -43,11 +43,19 @@ def get_e2e_pipeline():
         import sys
         sys.path.insert(0, str(ROOT_DIR / "scripts"))
         from pipeline_e2e import DocumentSchemaPipeline
-        _e2e_pipeline = DocumentSchemaPipeline(
-            ocr_model_dir=FT_MODEL_DIR,
-            extractor_base_id="Qwen/Qwen2.5-0.5B-Instruct",
-            extractor_lora_dir=EXTRACTOR_DIR if EXTRACTOR_DIR.exists() else None
-        )
+        merged_dir = ROOT_DIR / "work" / "qwen_extractor_merged"
+        if merged_dir.exists():
+            _e2e_pipeline = DocumentSchemaPipeline(
+                ocr_model_dir=FT_MODEL_DIR,
+                extractor_base_id=str(merged_dir),
+                extractor_lora_dir=None
+            )
+        else:
+            _e2e_pipeline = DocumentSchemaPipeline(
+                ocr_model_dir=FT_MODEL_DIR,
+                extractor_base_id="Qwen/Qwen2.5-0.5B-Instruct",
+                extractor_lora_dir=EXTRACTOR_DIR if EXTRACTOR_DIR.exists() else None
+            )
     return _e2e_pipeline
 
 

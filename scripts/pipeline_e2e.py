@@ -188,3 +188,42 @@ Hãy trích xuất thông tin và trả về JSON theo đúng các key được 
                 "total_e2e_latency_ms": round(total_e2e_ms, 2)
             }
         }
+
+
+if __name__ == "__main__":
+    import argparse
+
+    parser = argparse.ArgumentParser(description="End-to-End Indra OCR + Schema Extractor Pipeline")
+    parser.add_argument("--image", default="work/demo_samples/sample_thongtu_86_btc.png")
+    parser.add_argument("--ocr-dir", default="work/model-vn-v2")
+    parser.add_argument("--extractor-dir", default="work/qwen_extractor_merged")
+    args = parser.parse_args()
+
+    pipeline = DocumentSchemaPipeline(
+        ocr_model_dir=args.ocr_dir,
+        extractor_base_id=args.extractor_dir,
+        extractor_lora_dir=None
+    )
+
+    test_schema = {
+        "so_hieu": "Số hiệu chính thức của thông tư hoặc văn bản",
+        "co_quan_ban_hanh": "Tên cơ quan ban hành văn bản",
+        "ngay_ban_hanh": "Ngày tháng năm ban hành văn bản",
+        "nguoi_ky": "Họ và tên người ký văn bản",
+        "tong_tien_vat": "Tổng số tiền thuế giá trị gia tăng (nếu có)",
+        "thoi_han_bao_hanh": "Thời hạn bảo hành hợp đồng (nếu có)"
+    }
+
+    print(f"\nProcessing {args.image}...")
+    res = pipeline.process_document(args.image, test_schema)
+
+    print("\n--- OCR MARKDOWN TEXT ---")
+    print(res["markdown_text"])
+
+    print("\n--- EXTRACTED JSON ---")
+    print(json.dumps(res["extracted_json"], ensure_ascii=False, indent=2))
+
+    print("\n--- LATENCY REPORT ---")
+    print(f"OCR Latency:        {res['latency']['ocr_latency_ms']} ms")
+    print(f"Extraction Latency: {res['latency']['extraction_latency_ms']} ms")
+    print(f"Total E2E Latency:  {res['latency']['total_e2e_latency_ms']} ms")
