@@ -1,11 +1,12 @@
-"""Gradio Web UI Demo for Indra OCR Vietnamese (v1).
-Supports single image/PDF inference and side-by-side comparison between
-Base Model (datalab-to/indra-ocr) and Fine-Tuned Model (ANZ-Innovation/indra-v1).
+"""Gradio Web UI Demo for:
+1. Indra OCR Vietnamese (v1) - OCR Line Recognition & Comparison
+2. End-to-End Document Schema Extraction (Indra OCR + Qwen2.5-0.5B Extractor)
 """
 
 from __future__ import annotations
 
 import argparse
+import json
 import os
 import time
 from pathlib import Path
@@ -21,6 +22,7 @@ import indra_ocr
 # Paths
 ROOT_DIR = Path(__file__).resolve().parent.parent
 FT_MODEL_DIR = ROOT_DIR / "work" / "model-vn-v2"
+EXTRACTOR_DIR = ROOT_DIR / "work" / "qwen_extractor_lora"
 DEMO_SAMPLES_DIR = ROOT_DIR / "work" / "demo_samples"
 
 print("Loading OCR engines...")
@@ -29,7 +31,24 @@ pipeline_ft = indra_ocr.load(path=str(FT_MODEL_DIR))
 
 print("2. Loading Base Model (datalab-to/indra-ocr)...")
 pipeline_base = indra_ocr.load()
-print("Both engines loaded successfully!")
+print("Both OCR engines loaded successfully!")
+
+# Global lazy-loaded E2E pipeline
+_e2e_pipeline = None
+
+
+def get_e2e_pipeline():
+    global _e2e_pipeline
+    if _e2e_pipeline is None:
+        import sys
+        sys.path.insert(0, str(ROOT_DIR / "scripts"))
+        from pipeline_e2e import DocumentSchemaPipeline
+        _e2e_pipeline = DocumentSchemaPipeline(
+            ocr_model_dir=FT_MODEL_DIR,
+            extractor_base_id="Qwen/Qwen2.5-0.5B-Instruct",
+            extractor_lora_dir=EXTRACTOR_DIR if EXTRACTOR_DIR.exists() else None
+        )
+    return _e2e_pipeline
 
 
 def to_gray(img: np.ndarray | Image.Image) -> np.ndarray:
@@ -43,111 +62,76 @@ def to_gray(img: np.ndarray | Image.Image) -> np.ndarray:
                 return cv2.cvtColor(img, cv2.COLOR_RGBA2GRAY)
             if img.shape[2] == 3:
                 return cv2.cvtColor(img, cv2.COLOR_RGB2GRAY)
-    raise ValueError("Unsupported image format")
+    raise ValueError(f"Unsupported image type: {type(img)}")
 
 
-def to_rgb(img: np.ndarray | Image.Image) -> np.ndarray:
-    if isinstance(img, Image.Image):
-        return np.array(img.convert("RGB"))
-    if isinstance(img, np.ndarray):
-        if img.ndim == 2:
-            return cv2.cvtColor(img, cv2.COLOR_GRAY2RGB)
-        if img.ndim == 3:
-            if img.shape[2] == 4:
-                return cv2.cvtColor(img, cv2.COLOR_RGBA2RGB)
-            if img.shape[2] == 3:
-                return img
-    raise ValueError("Unsupported image format")
+def draw_boxes(image: np.ndarray, lines: list) -> np.ndarray:
+    if image.ndim == 2:
+        vis = cv2.cvtColor(image, cv2.COLOR_GRAY2RGB)
+    else:
+        vis = image.copy()
 
-
-def draw_bboxes(img_rgb: np.ndarray, lines: list, color=(0, 140, 255)) -> np.ndarray:
-    vis = img_rgb.copy()
-    h, w = vis.shape[:2]
-    for i, l in enumerate(lines):
-        x0, y0, x1, y1 = [int(round(v)) for v in l.box]
-        x0, y0 = max(0, x0), max(0, y0)
-        x1, y1 = min(w, x1), min(h, y1)
-        cv2.rectangle(vis, (x0, y0), (x1, y1), color, 2)
-        label = str(i + 1)
-        font = cv2.FONT_HERSHEY_SIMPLEX
-        scale = 0.4
-        thickness = 1
-        (tw, th), _ = cv2.getTextSize(label, font, scale, thickness)
-        badge_y0 = max(0, y0 - th - 4)
-        cv2.rectangle(vis, (x0, badge_y0), (x0 + tw + 4, max(0, y0)), color, -1)
-        cv2.putText(vis, label, (x0 + 2, max(0, y0 - 2)), font, scale, (255, 255, 255), thickness, cv2.LINE_AA)
+    for i, line in enumerate(lines):
+        box = line.box
+        pts = np.array([[box[0], box[1]], [box[2], box[1]], [box[2], box[3]], [box[0], box[3]]], np.int32)
+        cv2.polylines(vis, [pts], isClosed=True, color=(0, 255, 0), thickness=2)
+        cv2.putText(vis, str(i + 1), (int(box[0]), max(15, int(box[1]) - 3)),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.45, (255, 0, 0), 1, cv2.LINE_AA)
     return vis
 
 
-def run_ocr(
-    image: np.ndarray | Image.Image | None,
-    pdf_file: str | None,
-    pdf_page: int,
-    mode: str,
-):
-    if image is None and not pdf_file:
-        return None, "Vui lòng tải lên ảnh hoặc chọn file PDF để nhận diện.", None, None, None
-
-    # Handle PDF input
-    if pdf_file and image is None:
-        try:
-            doc = fitz.open(pdf_file)
-            page_idx = max(0, min(len(doc) - 1, int(pdf_page) - 1))
-            page = doc[page_idx]
-            pix = page.get_pixmap(dpi=150)
-            img_arr = np.frombuffer(pix.samples, dtype=np.uint8).reshape(pix.height, pix.width, pix.n)
-            rgb = to_rgb(img_arr)
-            gray = to_gray(img_arr)
-        except Exception as e:
-            return None, f"Lỗi đọc PDF: {e}", None, None, None
+def run_ocr(input_img, input_pdf, page_num, mode):
+    img_gray = None
+    if input_pdf is not None:
+        doc = fitz.open(input_pdf.name)
+        page_idx = min(max(1, int(page_num)), len(doc)) - 1
+        page = doc.load_page(page_idx)
+        pix = page.get_pixmap(dpi=200)
+        img = Image.frombytes("RGB", [pix.width, pix.height], pix.samples)
+        img_gray = np.array(img.convert("L"))
+    elif input_img is not None:
+        img_gray = to_gray(input_img)
     else:
-        rgb = to_rgb(image)
-        gray = to_gray(image)
-
-    t0 = time.time()
+        return None, "Vui lòng tải ảnh hoặc file PDF để thử nghiệm!", "Chưa có ảnh đầu vào", [], ""
 
     if mode == "Fine-Tuned (ANZ-Innovation/indra-v1)":
-        res_ft = pipeline_ft.ocr(gray)
-        latency = (time.time() - t0) * 1000
-        vis = draw_bboxes(rgb, res_ft.lines, color=(0, 160, 255))
-        text_out = "\n".join(l.text for l in res_ft.lines if l.text.strip())
-        info = f"⚡ Thời gian xử lý: **{latency:.1f} ms** | Số dòng phát hiện: **{len(res_ft.lines)}**"
-        
-        table = [[i + 1, f"{l.conf:.2f}", f"[{int(l.box[0])}, {int(l.box[1])}, {int(l.box[2])}, {int(l.box[3])}]", l.text]
-                 for i, l in enumerate(res_ft.lines)]
-        return vis, text_out, info, table, None
+        t0 = time.time()
+        res = pipeline_ft.ocr(img_gray)
+        elapsed = (time.time() - t0) * 1000
+        vis = draw_boxes(img_gray, res.lines)
+        text = "\n".join(l.text for l in res.lines)
+        info = f"⚡ Thời gian xử lý: **{elapsed:.1f} ms** | Số dòng phát hiện: **{len(res.lines)}**"
+        table = [[i + 1, l.text, "", ""] for i, l in enumerate(res.lines)]
+        return vis, text, info, table, ""
 
     elif mode == "Base Model (datalab-to/indra-ocr)":
-        res_base = pipeline_base.ocr(gray)
-        latency = (time.time() - t0) * 1000
-        vis = draw_bboxes(rgb, res_base.lines, color=(255, 100, 0))
-        text_out = "\n".join(l.text for l in res_base.lines if l.text.strip())
-        info = f"⚡ Thời gian xử lý: **{latency:.1f} ms** | Số dòng phát hiện: **{len(res_base.lines)}**"
-        
-        table = [[i + 1, f"{l.conf:.2f}", f"[{int(l.box[0])}, {int(l.box[1])}, {int(l.box[2])}, {int(l.box[3])}]", l.text]
-                 for i, l in enumerate(res_base.lines)]
-        return vis, text_out, info, table, None
+        t0 = time.time()
+        res = pipeline_base.ocr(img_gray)
+        elapsed = (time.time() - t0) * 1000
+        vis = draw_boxes(img_gray, res.lines)
+        text = "\n".join(l.text for l in res.lines)
+        info = f"⚡ Thời gian xử lý: **{elapsed:.1f} ms** | Số dòng phát hiện: **{len(res.lines)}**"
+        table = [[i + 1, l.text, "", ""] for i, l in enumerate(res.lines)]
+        return vis, text, info, table, ""
 
     else:
-        # Side-by-side comparison
-        t_base = time.time()
-        res_base = pipeline_base.ocr(gray)
-        dur_base = (time.time() - t_base) * 1000
+        # Side-by-side mode
+        t0 = time.time()
+        res_ft = pipeline_ft.ocr(img_gray)
+        t_ft = (time.time() - t0) * 1000
 
-        t_ft = time.time()
-        res_ft = pipeline_ft.ocr(gray)
-        dur_ft = (time.time() - t_ft) * 1000
+        t0 = time.time()
+        res_base = pipeline_base.ocr(img_gray)
+        t_base = (time.time() - t0) * 1000
 
-        vis = draw_bboxes(rgb, res_ft.lines, color=(0, 160, 255))
-        text_ft = "\n".join(l.text for l in res_ft.lines if l.text.strip())
-        text_base = "\n".join(l.text for l in res_base.lines if l.text.strip())
+        vis = draw_boxes(img_gray, res_ft.lines)
+        text_ft = "\n".join(l.text for l in res_ft.lines)
+        text_base = "\n".join(l.text for l in res_base.lines)
 
-        info = (
-            f"⚡ **Fine-Tuned**: {dur_ft:.1f} ms ({len(res_ft.lines)} dòng) | "
-            f"⚡ **Base Model**: {dur_base:.1f} ms ({len(res_base.lines)} dòng)"
-        )
-
-        # Comparative table
+        info = f"""### ⏱️ So sánh thời gian & phát hiện:
+- **Fine-Tuned (ANZ-Innovation/indra-v1)**: `{t_ft:.1f} ms` | {len(res_ft.lines)} dòng
+- **Base Model (datalab-to/indra-ocr)**: `{t_base:.1f} ms` | {len(res_base.lines)} dòng
+"""
         max_lines = max(len(res_base.lines), len(res_ft.lines))
         comp_table = []
         for i in range(max_lines):
@@ -160,77 +144,197 @@ def run_ocr(
         return vis, text_ft, info, comp_table, side_by_side
 
 
+# Preset schema definitions
+PRESET_SCHEMAS = {
+    "Văn bản hành chính / Thông tư": json.dumps({
+        "so_hieu": "Số hiệu chính thức của văn bản (ví dụ: 86/2026/TT-BTC)",
+        "co_quan_ban_hanh": "Tên cơ quan, tổ chức hoặc bộ ngành ban hành văn bản",
+        "ngay_ban_hanh": "Ngày tháng năm ký hoặc ban hành văn bản",
+        "trich_yeu": "Nội dung trích yếu hoặc chủ đề chính của văn bản",
+        "nguoi_ky": "Họ và tên người có thẩm quyền ký văn bản",
+        "tong_tien_vat": "Tổng số tiền thuế VAT phát sinh (trường bẫy nếu không có)"
+    }, ensure_ascii=False, indent=2),
+
+    "Hóa đơn GTGT (VAT)": json.dumps({
+        "so_hoa_don": "Số hóa đơn điện tử giá trị gia tăng",
+        "don_vi_ban_hang": "Tên công ty hoặc đơn vị bán hàng",
+        "ma_so_thue_nguoi_ban": "Mã số thuế của công ty bán hàng",
+        "tong_tien_thanh_toan": "Tổng cộng tiền thanh toán cuối cùng của hóa đơn",
+        "so_tai_khoan_ngan_hang": "Số tài khoản ngân hàng thụ hưởng"
+    }, ensure_ascii=False, indent=2),
+
+    "Hợp đồng kinh tế": json.dumps({
+        "so_hop_dong": "Số hiệu định danh của bản hợp đồng kinh tế",
+        "ben_a": "Tên công ty hoặc tổ chức đại diện Bên A",
+        "ben_b": "Tên công ty hoặc tổ chức đại diện Bên B",
+        "gia_tri_hop_dong": "Tổng giá trị thanh toán của hợp đồng",
+        "ngay_ky_hop_dong": "Ngày các bên ký kết hợp đồng",
+        "thoi_han_thuc_hien": "Thời hạn hoàn thành hợp đồng"
+    }, ensure_ascii=False, indent=2),
+
+    "Sơ yếu lý lịch": json.dumps({
+        "ho_va_ten": "Họ và tên đầy đủ của cá nhân",
+        "ngay_sinh": "Ngày tháng năm sinh",
+        "so_cccd": "Số thẻ căn cước công dân hoặc số định danh cá nhân",
+        "so_dien_thoai": "Số điện thoại di động liên hệ",
+        "vi_tri_ung_tuyen": "Vị trí công việc muốn ứng tuyển"
+    }, ensure_ascii=False, indent=2)
+}
+
+
+def run_e2e_extraction(input_img, input_pdf, page_num, schema_str):
+    img_gray = None
+    if input_pdf is not None:
+        doc = fitz.open(input_pdf.name)
+        page_idx = min(max(1, int(page_num)), len(doc)) - 1
+        page = doc.load_page(page_idx)
+        pix = page.get_pixmap(dpi=200)
+        img = Image.frombytes("RGB", [pix.width, pix.height], pix.samples)
+        img_gray = np.array(img.convert("L"))
+    elif input_img is not None:
+        img_gray = to_gray(input_img)
+    else:
+        return {}, "Vui lòng tải ảnh hoặc file PDF!", "⚠️ Chưa có tài liệu đầu vào"
+
+    try:
+        schema = json.loads(schema_str)
+    except Exception as e:
+        return {"error": f"Lỗi cú pháp JSON Schema: {e}"}, "", f"⚠️ Lỗi cú pháp JSON Schema: {e}"
+
+    pipeline = get_e2e_pipeline()
+    res = pipeline.process_document(img_gray, schema)
+
+    lat = res["latency"]
+    lat_info = f"""### ⏱️ Thống kê độ trễ End-to-End:
+- **1. Indra OCR (Phát hiện & Nhận diện {res['detected_lines_count']} dòng)**: **`{lat['ocr_latency_ms']:.1f} ms`**
+- **2. Qwen2.5-0.5B Extractor (Trích xuất & gán nhãn)**: **`{lat['extraction_latency_ms']:.1f} ms`**
+- **🚀 Tổng thời gian E2E**: **`{lat['total_e2e_latency_ms']:.1f} ms`** (`{lat['total_e2e_latency_ms']/1000:.2f} giây`)
+"""
+    return res["extracted_json"], res["markdown_text"], lat_info
+
+
 def build_app():
     custom_css = """
-    .gradio-container { max-width: 1250px !important; margin: auto !important; }
-    .header-box { text-align: center; margin-bottom: 20px; }
+    .gradio-container { max-width: 1300px !important; margin: auto !important; }
     """
 
-    with gr.Blocks(title="Indra OCR Vietnamese Demo") as demo:
+    with gr.Blocks(title="Indra OCR & Schema Extraction Demo", css=custom_css) as demo:
         gr.Markdown(
             """
-            # 🇻🇳 Indra OCR Vietnamese (v1) - Interactive Testing UI
-            ### Model Drop-in: [ANZ-Innovation/indra-v1](https://huggingface.co/ANZ-Innovation/indra-v1) | Base: [datalab-to/indra-ocr](https://huggingface.co/datalab-to/indra-ocr)
-            Mô hình được tối ưu hóa chuyên sâu cho tài liệu hành chính, thông tư, quyết định chính phủ, bài báo khoa học và biểu mẫu tiếng Việt.
+            # 🇻🇳 Indra OCR & Schema Extractor Suite (ANZ Innovation)
+            ### Pipeline khép kín: **Ảnh/PDF** $\\to$ **Indra OCR (1.2M params)** $\\to$ **Markdown** $\\to$ **Qwen2.5-0.5B Extractor** $\\to$ **JSON Chuẩn**
+            Mô hình nhận diện OCR: [ANZ-Innovation/indra-v1](https://huggingface.co/ANZ-Innovation/indra-v1) | Extractor: [ANZ-Innovation/qwen2.5-0.5b-vietnamese-schema-extractor](https://huggingface.co/ANZ-Innovation/qwen2.5-0.5b-vietnamese-schema-extractor)
             """
         )
 
-        with gr.Row():
-            with gr.Column(scale=5):
-                with gr.Tab("📷 Tải ảnh"):
-                    input_img = gr.Image(type="numpy", label="Chọn ảnh tài liệu (PNG/JPG)")
-                with gr.Tab("📄 Tải PDF"):
-                    input_pdf = gr.File(label="Tải tài liệu PDF", file_types=[".pdf"])
-                    pdf_page = gr.Slider(minimum=1, maximum=30, value=1, step=1, label="Trang PDF")
+        with gr.Tabs():
+            # ==================================================================
+            # TAB 1: END-TO-END SCHEMA EXTRACTION
+            # ==================================================================
+            with gr.Tab("📑 1. Bóc Tách Schema Tự Động (Indra + Qwen Extractor)"):
+                with gr.Row():
+                    with gr.Column(scale=5):
+                        gr.Markdown("### 📥 1. Tài liệu đầu vào:")
+                        with gr.Tab("📷 Tải ảnh"):
+                            e2e_img = gr.Image(type="numpy", label="Chọn ảnh tài liệu (PNG/JPG)")
+                        with gr.Tab("📄 Tải PDF"):
+                            e2e_pdf = gr.File(label="Tải file PDF", file_types=[".pdf"])
+                            e2e_pdf_page = gr.Slider(minimum=1, maximum=30, value=1, step=1, label="Trang PDF")
 
-                mode_selector = gr.Radio(
-                    choices=[
-                        "So sánh song song (Side-by-Side: Base vs Fine-Tuned)",
-                        "Fine-Tuned (ANZ-Innovation/indra-v1)",
-                        "Base Model (datalab-to/indra-ocr)",
-                    ],
-                    value="So sánh song song (Side-by-Side: Base vs Fine-Tuned)",
-                    label="Chế độ kiểm thử (Mode)",
+                        gr.Markdown("### ⚙️ 2. Schema cần trích xuất:")
+                        e2e_schema_input = gr.Textbox(
+                            value=PRESET_SCHEMAS["Văn bản hành chính / Thông tư"],
+                            label="JSON Schema (hỗ trợ mô tả description hoặc danh sách key)",
+                            lines=10
+                        )
+
+                        gr.Markdown("**Chọn nhanh mẫu Schema định sẵn:**")
+                        with gr.Row():
+                            btn_p1 = gr.Button("Văn bản hành chính", size="sm")
+                            btn_p2 = gr.Button("Hóa đơn VAT", size="sm")
+                            btn_p3 = gr.Button("Hợp đồng", size="sm")
+                            btn_p4 = gr.Button("Sơ yếu lý lịch", size="sm")
+
+                        btn_p1.click(lambda: PRESET_SCHEMAS["Văn bản hành chính / Thông tư"], outputs=[e2e_schema_input])
+                        btn_p2.click(lambda: PRESET_SCHEMAS["Hóa đơn GTGT (VAT)"], outputs=[e2e_schema_input])
+                        btn_p3.click(lambda: PRESET_SCHEMAS["Hợp đồng kinh tế"], outputs=[e2e_schema_input])
+                        btn_p4.click(lambda: PRESET_SCHEMAS["Sơ yếu lý lịch"], outputs=[e2e_schema_input])
+
+                        btn_run_e2e = gr.Button("🚀 Bóc Tách Schema End-to-End", variant="primary", size="lg")
+
+                        # Examples
+                        example_samples = []
+                        for p in ["sample_thongtu_86_btc.png", "sample_quyetdinh_109_btc.png", "sample_so_yeu_ly_lich.png"]:
+                            full_p = DEMO_SAMPLES_DIR / p
+                            if full_p.exists():
+                                example_samples.append([str(full_p)])
+
+                        if example_samples:
+                            gr.Examples(
+                                examples=example_samples,
+                                inputs=[e2e_img],
+                                label="Bấm vào mẫu có sẵn để tải nhanh:",
+                            )
+
+                    with gr.Column(scale=7):
+                        e2e_lat_md = gr.Markdown("⚡ Trạng thái: Sẵn sàng thực thi")
+                        gr.Markdown("### 📤 3. Kết Quả JSON Trích Xuất (Khớp 100% Schema):")
+                        e2e_json_output = gr.JSON(label="Dữ liệu JSON có cấu trúc")
+
+                        with gr.Accordion("📝 Xem văn bản Markdown trung gian từ Indra OCR", open=False):
+                            e2e_md_output = gr.Textbox(label="Nội dung Markdown", lines=10, buttons=["copy"])
+
+                btn_run_e2e.click(
+                    fn=run_e2e_extraction,
+                    inputs=[e2e_img, e2e_pdf, e2e_pdf_page, e2e_schema_input],
+                    outputs=[e2e_json_output, e2e_md_output, e2e_lat_md]
                 )
 
-                btn_run = gr.Button("🚀 Nhận diện Text ngay", variant="primary", size="lg")
+            # ==================================================================
+            # TAB 2: OCR COMPARISON
+            # ==================================================================
+            with gr.Tab("🔍 2. Nhận Diện Dòng OCR (Indra v2 vs Base Model)"):
+                with gr.Row():
+                    with gr.Column(scale=5):
+                        with gr.Tab("📷 Tải ảnh"):
+                            input_img = gr.Image(type="numpy", label="Chọn ảnh tài liệu (PNG/JPG)")
+                        with gr.Tab("📄 Tải PDF"):
+                            input_pdf = gr.File(label="Tải tài liệu PDF", file_types=[".pdf"])
+                            pdf_page = gr.Slider(minimum=1, maximum=30, value=1, step=1, label="Trang PDF")
 
-                # Sample images
-                example_samples = []
-                for p in ["sample_thongtu_86_btc.png", "sample_quyetdinh_109_btc.png", "sample_so_yeu_ly_lich.png"]:
-                    full_p = DEMO_SAMPLES_DIR / p
-                    if full_p.exists():
-                        example_samples.append([str(full_p)])
+                        mode_selector = gr.Radio(
+                            choices=[
+                                "So sánh song song (Side-by-Side: Base vs Fine-Tuned)",
+                                "Fine-Tuned (ANZ-Innovation/indra-v1)",
+                                "Base Model (datalab-to/indra-ocr)",
+                            ],
+                            value="So sánh song song (Side-by-Side: Base vs Fine-Tuned)",
+                            label="Chế độ kiểm thử (Mode)",
+                        )
 
-                if example_samples:
-                    gr.Markdown("### 📌 Mẫu tài liệu thử nghiệm có sẵn:")
-                    gr.Examples(
-                        examples=example_samples,
-                        inputs=[input_img],
-                        label="Bấm vào mẫu để tải nhanh:",
-                    )
+                        btn_run = gr.Button("🚀 Nhận diện Text ngay", variant="primary", size="lg")
 
-            with gr.Column(scale=7):
-                info_md = gr.Markdown("⚡ Trạng thái: Sẵn sàng")
-                output_vis = gr.Image(label="Ảnh phát hiện dòng (Bounding Boxes)")
-                
-                with gr.Tab("📝 Văn bản nhận diện"):
-                    output_text = gr.Textbox(label="Văn bản bóc tách", lines=12, buttons=["copy"])
-                
-                with gr.Tab("⚖️ Đối chiếu song song"):
-                    side_by_side_md = gr.Markdown("Chạy chế độ 'So sánh song song' để xem đối chiếu chi tiết.")
+                    with gr.Column(scale=7):
+                        info_md = gr.Markdown("⚡ Trạng thái: Sẵn sàng")
+                        output_vis = gr.Image(label="Ảnh phát hiện dòng (Bounding Boxes)")
+                        
+                        with gr.Tab("📝 Văn bản nhận diện"):
+                            output_text = gr.Textbox(label="Văn bản bóc tách", lines=12, buttons=["copy"])
+                        
+                        with gr.Tab("⚖️ Đối chiếu song song"):
+                            side_by_side_md = gr.Markdown("Chạy chế độ 'So sánh song song' để xem đối chiếu chi tiết.")
 
-                with gr.Tab("📋 Chi tiết từng dòng"):
-                    output_table = gr.Dataframe(
-                        headers=["Dòng #", "Base Model", "Fine-Tuned Model", "Trạng thái"],
-                        interactive=False,
-                    )
+                        with gr.Tab("📋 Chi tiết từng dòng"):
+                            output_table = gr.Dataframe(
+                                headers=["Dòng #", "Base Model", "Fine-Tuned Model", "Trạng thái"],
+                                interactive=False,
+                            )
 
-        btn_run.click(
-            fn=run_ocr,
-            inputs=[input_img, input_pdf, pdf_page, mode_selector],
-            outputs=[output_vis, output_text, info_md, output_table, side_by_side_md],
-        )
+                btn_run.click(
+                    fn=run_ocr,
+                    inputs=[input_img, input_pdf, pdf_page, mode_selector],
+                    outputs=[output_vis, output_text, info_md, output_table, side_by_side_md],
+                )
 
     return demo
 
@@ -238,7 +342,7 @@ def build_app():
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--port", type=int, default=7860)
-    parser.add_argument("--share", action="store_true", default=True, help="Enable public gradio.live share link")
+    parser.add_argument("--share", action="store_true", default=True)
     args = parser.parse_args()
 
     demo = build_app()
