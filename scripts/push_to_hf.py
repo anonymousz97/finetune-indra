@@ -79,7 +79,8 @@ Evaluated on held-out Vietnamese test data across administrative (Chinhphu), aca
   - **Sources**:
     - Government decrees & administrative documents (Chinhphu): {src.get('chinhphu_administrative', 0):,} lines
     - Academic journals & scientific publications (VJOL): {src.get('vjol_academic', 0):,} lines
-    - Structured documents, forms, resumes & tables: {src.get('datalab_forms_tables', 0):,} lines
+    - Datalab DBNet detector-matched clean document lines: {src.get('datalab_detector_matched', 0):,} lines
+    - Photorealistic synthetic document lines (Liberation Serif/Sans, Lato, DejaVu): {src.get('synthetic_vietnamese_128fonts', 0):,} lines
 
 ---
 

@@ -20,7 +20,7 @@ import indra_ocr
 
 # Paths
 ROOT_DIR = Path(__file__).resolve().parent.parent
-FT_MODEL_DIR = ROOT_DIR / "work" / "model-vn-clean"
+FT_MODEL_DIR = ROOT_DIR / "work" / "model-vn-v2"
 DEMO_SAMPLES_DIR = ROOT_DIR / "work" / "demo_samples"
 
 print("Loading OCR engines...")
