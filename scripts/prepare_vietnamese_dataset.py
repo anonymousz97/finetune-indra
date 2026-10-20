@@ -109,10 +109,23 @@ def extract_from_datalab_zip(zip_path: str, max_pages: int = 0) -> list[tuple[np
                     continue
 
                 d = json.loads(z.open(rf).read().decode("utf-8"))
+                # Coordinate scale between JSON page coordinates and image pixels
+                page_bbox = d.get("json", {}).get("children", [{}])[0].get("bbox")
+                if not page_bbox or len(page_bbox) != 4:
+                    continue
+                pw = page_bbox[2] - page_bbox[0]
+                ph = page_bbox[3] - page_bbox[1]
+                if pw <= 0 or ph <= 0:
+                    continue
+
+                ih, iw = gray.shape
+                sx = iw / pw
+                sy = ih / ph
+
                 children = d.get("json", {}).get("children", [{}])[0].get("children", [])
                 for sc in children:
                     b_type = sc.get("block_type")
-                    if b_type not in ["Text", "SectionHeader", "PageHeader", "Form", "Table"]:
+                    if b_type not in ["Text", "SectionHeader", "PageHeader", "Form"]:
                         continue
                     bbox = sc.get("bbox")
                     if not bbox or len(bbox) != 4:
@@ -122,31 +135,23 @@ def extract_from_datalab_zip(zip_path: str, max_pages: int = 0) -> list[tuple[np
                     if not lines:
                         continue
 
-                    # If block has 1 line, its bbox maps directly to the line
+                    # Only accept true single-line blocks (1-to-1 crop-to-text correspondence)
                     if len(lines) == 1:
                         text = canonical(lines[0])
-                        if len(text) >= 2 and len(text) <= 120:
-                            box = bbox
-                            if box[2] - box[0] >= 10 and box[3] - box[1] >= 5:
-                                crop = crop_line(gray, box)
-                                if crop.shape[1] >= 16:
-                                    results.append((crop, text))
-                    else:
-                        # For multi-line blocks, slice proportionally along vertical height
-                        total_lines = len(lines)
-                        block_h = bbox[3] - bbox[1]
-                        line_h = block_h / total_lines
-                        for idx, l_text in enumerate(lines):
-                            text = canonical(l_text)
-                            if len(text) < 2 or len(text) > 120:
-                                continue
-                            y0 = bbox[1] + idx * line_h
-                            y1 = y0 + line_h
-                            box = [bbox[0], y0, bbox[2], y1]
-                            if box[2] - box[0] >= 10 and box[3] - box[1] >= 5:
-                                crop = crop_line(gray, box)
-                                if crop.shape[1] >= 16:
-                                    results.append((crop, text))
+                        if len(text) < 2 or len(text) > 120:
+                            continue
+                        # Scale to actual image coordinates
+                        scaled_box = [bbox[0] * sx, bbox[1] * sy, bbox[2] * sx, bbox[3] * sy]
+                        bw = scaled_box[2] - scaled_box[0]
+                        bh = scaled_box[3] - scaled_box[1]
+                        # High-quality line criteria:
+                        # 1. Height between 10px and 65px (standard line height range in 150-200 DPI docs)
+                        # 2. Aspect ratio bw / bh >= 3.0 (ensures horizontal text line, not multi-line or square icon)
+                        # 3. Width >= 25px
+                        if 10 <= bh <= 65 and bw >= 25 and (bw / max(1.0, bh)) >= 3.0:
+                            crop = crop_line(gray, scaled_box)
+                            if crop.shape[1] >= 16:
+                                results.append((crop, text))
             except Exception:
                 continue
     return results
