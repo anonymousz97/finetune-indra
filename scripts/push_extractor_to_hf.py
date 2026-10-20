@@ -100,21 +100,18 @@ Evaluated on held-out test documents spanning Administrative Decrees (Chính ph�
 ### 1. In Python with `transformers` and `peft`:
 
 ```bash
-pip install transformers peft torch
+pip install transformers torch accelerate
 ```
 
 ```python
 import json
 import torch
 from transformers import AutoTokenizer, AutoModelForCausalLM
-from peft import PeftModel
 
-base_model_id = "{base_model_id}"
-lora_repo_id = "{repo_id}"
+model_id = "{repo_id}"
 
-tokenizer = AutoTokenizer.from_pretrained(base_model_id)
-base_model = AutoModelForCausalLM.from_pretrained(base_model_id, torch_dtype=torch.bfloat16, device_map="auto")
-model = PeftModel.from_pretrained(base_model, lora_repo_id)
+tokenizer = AutoTokenizer.from_pretrained(model_id)
+model = AutoModelForCausalLM.from_pretrained(model_id, torch_dtype=torch.bfloat16, device_map="auto")
 model.eval()
 
 markdown_text = \"\"\"# BỘ TÀI CHÍNH
@@ -190,14 +187,53 @@ Developed by [ANZ Innovation](https://huggingface.co/ANZ-Innovation).
 """
 
 
+def merge_and_export_standalone(
+    base_model_id: str,
+    lora_dir: Path,
+    output_dir: Path,
+) -> Path:
+    import torch
+    from transformers import AutoModelForCausalLM, AutoTokenizer
+    from peft import PeftModel
+
+    print(f"Loading base model {base_model_id} for merging...")
+    tokenizer = AutoTokenizer.from_pretrained(str(lora_dir))
+    base_model = AutoModelForCausalLM.from_pretrained(
+        base_model_id,
+        torch_dtype=torch.bfloat16,
+        device_map="auto",
+    )
+    print(f"Applying LoRA adapter from {lora_dir}...")
+    model = PeftModel.from_pretrained(base_model, str(lora_dir))
+    print("Merging LoRA weights into base model...")
+    merged_model = model.merge_and_unload()
+
+    output_dir.mkdir(parents=True, exist_ok=True)
+    print(f"Saving merged standalone model to {output_dir}...")
+    merged_model.save_pretrained(str(output_dir))
+    tokenizer.save_pretrained(str(output_dir))
+    print(f"Merged standalone model saved successfully at {output_dir}!")
+    return output_dir
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--model-dir", type=Path, default=Path("work/qwen_extractor_lora"))
+    parser.add_argument("--merged-dir", type=Path, default=Path("work/qwen_extractor_merged"))
     parser.add_argument("--dataset-dir", type=Path, default=Path("work/schema_dataset"))
     parser.add_argument("--repo-id", default="ANZ-Innovation/qwen2.5-0.5b-vietnamese-schema-extractor")
     parser.add_argument("--base-model-id", default="Qwen/Qwen2.5-0.5B-Instruct")
+    parser.add_argument("--merge", action="store_true", default=True, help="Merge LoRA into base model before uploading")
     parser.add_argument("--private", action="store_true", default=False)
     args = parser.parse_args()
+
+    upload_dir = args.model_dir
+    if args.merge:
+        upload_dir = merge_and_export_standalone(
+            base_model_id=args.base_model_id,
+            lora_dir=args.model_dir,
+            output_dir=args.merged_dir,
+        )
 
     api = HfApi()
 
@@ -213,12 +249,16 @@ def main():
         dataset_stats = json.loads((args.dataset_dir / "stats.json").read_text())
 
     readme_content = generate_model_card(args.repo_id, args.base_model_id, eval_results, dataset_stats)
-    (args.model_dir / "README.md").write_text(readme_content)
-    print(f"Generated README.md at {args.model_dir / 'README.md'}")
+    (upload_dir / "README.md").write_text(readme_content)
+    print(f"Generated README.md at {upload_dir / 'README.md'}")
 
-    print(f"Uploading folder {args.model_dir} to {args.repo_id}...")
+    # Copy eval results as well
+    if (args.model_dir / "eval_results.json").exists():
+        (upload_dir / "eval_results.json").write_text(json.dumps(eval_results, indent=2))
+
+    print(f"Uploading folder {upload_dir} to {args.repo_id}...")
     api.upload_folder(
-        folder_path=str(args.model_dir),
+        folder_path=str(upload_dir),
         repo_id=args.repo_id,
         repo_type="model",
         commit_message="Add fine-tuned Qwen2.5-0.5B Vietnamese Schema Extractor with Trained Abstention",
